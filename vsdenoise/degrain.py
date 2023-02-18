@@ -1,7 +1,7 @@
 import vapoursynth as vs
 from dataclasses import dataclass
-from vstools import fallback, get_color_family, get_depth, get_sample_type, mod4, core
-from vsrgtools import removegrain
+from vstools import fallback, get_color_family, get_depth, get_sample_type, mod4, core, get_neutral_value
+from vsrgtools import removegrain, gauss_blur
 
 from vsdenoise.mvtools import MVTools 
 
@@ -49,6 +49,7 @@ class TemporalDegrain2:
         height = clip.height
 
         bd = get_depth(clip)
+        neutral = get_neutral_value(clip)
         isFLOAT = get_sample_type(clip) == vs.FLOAT
         isGRAY = get_color_family(clip) == vs.GRAY
         # Seems to be used for some kind of bit depth scaling...
@@ -143,17 +144,21 @@ class TemporalDegrain2:
         thSAD1 = int(ppSAD1 * 64)
         thSAD2 = int(ppSAD2 * 64)
         thSCD1 = int(ppSCD1 * 64)
+        thSCD2 = self.thSCD2
 
         # TODO: This needs work.
         super_args = dict(pel=self.meSubpel)
 
         # TODO: Compare this with QTGMC's implementation.
+        # TODO: vs-denoise has prefilters for most of these.
         # Blur image and soften edges to assist in motion matching of edge blocks. Blocks are matched by SAD (sum of absolute differences between blocks), but even
         # a slight change in an edge from frame to frame will give a high SAD due to the higher contrast of edges
         if SrchClipPP == 1:
-            spatialBlur = removegrain(clip.resize.Bilinear(clip, m4(width/2), m4(height/2)), 12).resize.Bilinear(width,height)
+            # TODO Check to see if rgmode 12 works, if not just use 11 as its identical.
+            spatialBlur = removegrain(clip.resize.Bilinear(clip, m4(width/2), m4(height/2)), 11).resize.Bilinear(width,height)
         elif SrchClipPP > 1:
             # TODO - use gauss_blur from rgtools instead of TCanny?
+            # That's what QTGMC in havsfunc uses
             spatialBlur = clip.tcanny.TCanny(sigma=2, mode=-1, planes=CMplanes)
             spatialBlur = spatialBlur.std.Merge(clip, [0.1] if self.ChromaMotion or isGRAY else [0.1, 0])
         else:
@@ -170,7 +175,7 @@ class TemporalDegrain2:
         # progressively smaller blocksizes automatically, but it does, at least
         # to a degree
         refine = 1 if self.rec else 0
-        mv = MVTools(clip, tr=degrainTR, refine=refine, super_args=super_args, prefilter)
+        mv1 = MVTools(clip, tr=degrainTR, refine=refine, super_args=super_args, prefilter=srchClip)
 
         if degrainTR > 0:
             s2 = limitSigma * 0.625
@@ -179,12 +184,37 @@ class TemporalDegrain2:
             ovNum = [4, 4, 4, 3, 2, 2][grainLevel]
             ov = 2 * round(limitBlksz / ovNum * 0.5)
 
+            # TODO: Allow custom limit filters.
+
             if hasattr(core, 'neo_fft3d'):
               spat = core.neo_fft3d.FFT3D(clip, planes=fPlane, sigma=limitSigma, sigma2=s2, sigma3=s3, sigma4=s4, bt=3, bw=limitBlksz, bh=limitBlksz, ow=ov, oh=ov, ncpu=fftThreads)
             else:
               spat = core.fft3dfilter.FFT3DFilter(clip, planes=fPlane, sigma=limitSigma, sigma2=s2, sigma3=s3, sigma4=s4, bt=3, bw=limitBlksz, bh=limitBlksz, ow=ov, oh=ov, ncpu=fftThreads)
             spatD  = core.std.MakeDiff(clip, spat)
 
+        # First MV-denoising stage. Usually here's some temporal-medianfiltering going on.
+        NR1 = mv1.degrain(thSAD=thSAD1, thSCD=(thSCD1, thSCD2))
+
+        # Limit NR1 to not do more than what "spat" would do.
+        if degrainTR > 0:
+            NR1D = core.std.MakeDiff(clip, NR1)
+            expr = 'x abs y abs < x y ?' if isFLOAT else f'x {neutral} - abs y {neutral} - abs < x y ?'
+            DD   = core.std.Expr([spatD, NR1D], [expr])
+            NR1x = core.std.MakeDiff(clip, DD, [0])
+
+            # TODO Add plane configuration
+            # TODO Add thSADC support, like AVS version
+            mv2 = MVTools(NR1x, tr=degrainTR, refine=refine, super_args=super_args, prefilter)
+            NR2 = mv2.degrain(thSAD=thSAD2, thSCD=(thSCD1, thSCD2))
+        else
+            NR2 = clip
+
+        # TODO Add postTr/postFFT support.
+        # TODO update MVTools params
+        # TODO Use partial here to setup reusable functions for post FFT that can
+        # be used on compensated and non-compensated output easily.
+        if postTR > 0:
+            mvNoiseWindow = MVTools(NR2)
 
 
 
