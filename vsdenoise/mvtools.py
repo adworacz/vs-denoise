@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import chain
 from math import ceil, exp
-from typing import TYPE_CHECKING, Any, Literal, Sequence, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Self, Sequence, TypeVar, cast, overload
 
 from _collections_abc import dict_items, dict_keys, dict_values
 from vstools import (
@@ -29,6 +29,8 @@ __all__ = [
 ]
 
 
+
+
 class MVDirection(CustomStrEnum):
     """Motion vector analyze direction."""
 
@@ -48,9 +50,6 @@ class MVDirection(CustomStrEnum):
 class MotionVectors:
     vmulti: vs.VideoNode
     """Super analyzed clip."""
-
-    super_render: vs.VideoNode
-    """Super clip used for analyzing."""
 
     kwargs: dict[str, Any]
 
@@ -108,7 +107,6 @@ class MotionVectors:
         """Deletes all :py:class:`vsdenoise.mvtools.MotionVectors` attributes."""
 
         del self.vmulti
-        del self.super_render
         self.kwargs.clear()
         self.temporal_vectors.clear()
         self._init_vects()
@@ -393,13 +391,13 @@ class SearchModeBase:
         recalc_mode: SearchMode
         """SearchMode that decides which analysis mode to use for recalculation of motion vectors."""
 
-        param: int | None
+        param: int | None = None
         """Parameter used by the search mode in analysis."""
 
-        param_recalc: int | None
+        param_recalc: int | None = None
         """Parameter used by the search mode in recalculation."""
 
-        pel: int | None
+        pel: int | None = None
         """Parameter used by search mode for subpixel accuracy."""
 
 
@@ -614,6 +612,9 @@ class MVToolsPreset(MVToolsPresetBase):
     motion: property | MotionMode.Config | None = None
     prefilter: property | Prefilter | vs.VideoNode | None = None
     pel_type: property | PelType | tuple[PelType, PelType] | None = None
+    super_args: property | dict[str, Any] | None = None
+    analyze_args: property | dict[str, Any] | None = None
+    recalculate_args: property | dict[str, Any] | None = None
 
     if TYPE_CHECKING:
         def __call__(
@@ -625,7 +626,10 @@ class MVToolsPreset(MVToolsPresetBase):
             search: SearchMode | SearchMode.Config | None = None, motion: MotionMode.Config | None = None,
             sad_mode: SADMode | tuple[SADMode, SADMode] | None = None, rfilter: int | None = None,
             sharp: int | None = None, prefilter: Prefilter | vs.VideoNode | None = None,
-            pel_type: PelType | tuple[PelType, PelType] | None = None
+            pel_type: PelType | tuple[PelType, PelType] | None = None,
+            super_args: dict[str, Any] | None = None,
+            analyze_args: dict[str, Any] | None = None,
+            recalculate_args: dict[str, Any] | None = None,
         ) -> MVToolsPreset:
             ...
     else:
@@ -700,6 +704,9 @@ class MVTools:
 
     super_args: dict[str, Any]
     """Arguments passed to all the :py:attr:`MVToolsPlugin.Super` calls."""
+
+    super_render: vs.VideoNode
+    """Super clip used for analyzing/compensating/degraining."""
 
     analyze_args: dict[str, Any]
     """Arguments passed to all the :py:attr:`MVToolsPlugin.Analyze` calls."""
@@ -1059,12 +1066,13 @@ class MVTools:
         analyze_args = dict[str, Any](
             dct=sad_mode, pelsearch=search.pel, blksize=blocksize, overlap=overlap, search=search.mode,
             truemotion=motion.truemotion, searchparam=search.param, chroma=self.chroma,
-            plevel=motion.plevel, pglobal=motion.pglobal
+            plevel=motion.plevel, pglobal=motion.pglobal, pnew=motion.pnew, lambda_=motion.coherence,
         ) | self.analyze_args
 
         recalc_args = dict[str, Any](
             search=search.recalc_mode, dct=recalc_sad_mode, thsad=thSAD_recalc, blksize=halfblocksize,
             overlap=halfoverlap, truemotion=motion.truemotion, searchparam=search.param_recalc,
+            pnew=motion.pnew, lambda_=motion.coherence,
             chroma=self.chroma
         ) | self.recalculate_args
 
@@ -1101,7 +1109,7 @@ class MVTools:
 
                         _add_vector(i, False)
 
-        vectors.super_render = super_render
+        self.super_render = super_render
         vectors.kwargs.update(thSAD=thSAD)
 
         return vectors
@@ -1142,7 +1150,10 @@ class MVTools:
         return (vectors_backward, vectors_forward)
 
     def compensate(
-        self, func: GenericVSFunction, thSAD: int = 150, *, ref: vs.VideoNode | None = None, **kwargs: Any
+        self, func: GenericVSFunction, 
+        thSAD: int = 150,
+        thSCD: int | tuple[int | None, int | None] | None = (None, 51),
+        *, ref: vs.VideoNode | None = None, **kwargs: Any
     ) -> vs.VideoNode:
         """
         At compensation stage, the plugin client functions read the motion vectors and use them to move blocks
@@ -1161,6 +1172,22 @@ class MVTools:
         :param thSAD:       This is the SAD threshold for safe (dummy) compensation.\n
                             If block SAD is above thSAD, the block is bad, and we use source block
                             instead of the compensated block.
+        :param thSCD:       The first value is a threshold for whether a block has changed
+                            between the previous frame and the current one.\n
+                            When a block has changed, it means that motion estimation for it isn't relevant.
+                            It, for example, occurs at scene changes, and is one of the thresholds used to
+                            tweak the scene changes detection engine.\n
+                            Raising it will lower the number of blocks detected as changed.\n
+                            It may be useful for noisy or flickered video. This threshold is compared to the SAD value.\n
+                            For exactly identical blocks we have SAD = 0, but real blocks are always different
+                            because of objects complex movement (zoom, rotation, deformation),
+                            discrete pixels sampling, and noise.\n
+                            Suppose we have two compared 8×8 blocks with every pixel different by 5.\n
+                            It this case SAD will be 8×8×5 = 320 (block will not detected as changed for thSCD1 = 400).\n
+                            Actually this parameter is scaled internally in MVTools,
+                            and it is always relative to 8x8 block size.\n
+                            The second value is a threshold of the percentage of how many blocks have to change for
+                            the frame to be considered as a scene change. It ranges from 0 to 100 %.
         :param ref:         Reference clip to use instead of main clip.
         :param kwargs:      Keyword arguments passed to `func` to avoid using `partial`.
 
@@ -1170,9 +1197,11 @@ class MVTools:
         ref = self.get_ref_clip(ref, self.__class__.compensate)
 
         vect_b, vect_f = self.get_vectors_bf()
+        thSCD1, thSCD2 = _normalize_thscd(thSCD, thSAD, self.params_curve, self.__class__.compensate)
 
         compensate_args = dict(
-            super=self.vectors.super_render, thsad=thSAD,
+            super=self.super_render, thsad=thSAD,
+            thscd1=thSCD1, thscd2=thSCD2,
             tff=self.source_type.is_inter and self.source_type.value or None
         ) | self.compensate_args
 
@@ -1254,17 +1283,7 @@ class MVTools:
 
         limitf, limitCf = scale_value(limit, 8, ref), scale_value(limitC, 8, ref)
 
-        thSCD1, thSCD2 = thSCD if isinstance(thSCD, tuple) else (thSCD, None)
-
-        thSCD1 = fallback(thSCD1, round(0.35 * thSAD + 300) if self.params_curve else 400)
-        thSCD2 = fallback(thSCD2, 51)
-
-        if not 1 <= thSCD2 <= 100:
-            raise CustomOverflowError(
-                '"thSCD[1]" must be between 1 and 100 (inclusive)!', self.__class__.degrain
-            )
-
-        thSCD2 = int(thSCD2 / 100 * 255)
+        thSCD1, thSCD2 = _normalize_thscd(thSCD, thSAD, self.params_curve, self.__class__.degrain)
 
         degrain_args = dict[str, Any](thscd1=thSCD1, thscd2=thSCD2, plane=self.mv_plane)
 
@@ -1277,10 +1296,10 @@ class MVTools:
                 degrain_args.update(thsad2=[thSAD / 2, thSADC / 2])
 
         if self.mvtools is MVToolsPlugin.FLOAT_NEW:
-            output = self.mvtools.Degrain()(ref, self.vectors.super_render, self.vectors.vmulti, **degrain_args)
+            output = self.mvtools.Degrain()(ref, self.super_render, self.vectors.vmulti, **degrain_args)
         else:
             output = self.mvtools.Degrain(self.tr)(
-                ref, self.vectors.super_render, *chain.from_iterable(zip(vect_b, vect_f)), **degrain_args
+                ref, self.super_render, *chain.from_iterable(zip(vect_b, vect_f)), **degrain_args
             )
 
         return output.std.DoubleWeave(self.source_type.value) if self.source_type.is_inter else output
@@ -1325,3 +1344,18 @@ class MVTools:
                 clip, self.pel, PelType.WIENER if is_ref else PelType.BICUBIC
             ) for is_ref, ptype, clip in zip((False, True), pel_type, (pref, ref))
         )
+
+
+def _normalize_thscd(thSCD: int | tuple[int | None, int | None] | None,
+                     thSAD: int, params_curve: bool, cls: type[MVTools]):
+    thSCD1, thSCD2 = thSCD if isinstance(thSCD, tuple) else (thSCD, None)
+
+    thSCD1 = fallback(thSCD1, round(0.35 * thSAD + 300) if params_curve else 400)
+    thSCD2 = fallback(thSCD2, 51)
+
+    if not 1 <= thSCD2 <= 100:
+        raise CustomOverflowError('"thSCD[1]" must be between 1 and 100 (inclusive)!', cls)
+
+    thSCD2 = int(thSCD2 / 100 * 255)
+
+    return (thSCD1, thSCD2)
