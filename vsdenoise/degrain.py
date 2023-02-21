@@ -2,13 +2,19 @@ import vapoursynth as vs
 from typing import Callable
 from functools import partial
 from dataclasses import dataclass
-from vstools import fallback, get_color_family, get_depth, get_sample_type, inject_self, mod4, core, get_neutral_value
+from vstools import fallback, get_color_family, get_sample_type, mod4, core, get_neutral_value
 from vsrgtools import contrasharpening, removegrain
 from vsdenoise.dfttest import DFTTest
 from vsdenoise.knlm import nl_means
 
-from vsdenoise.mvtools import MVTools, MVToolsPreset, MVToolsPresets, SADMode, SearchMode, MotionMode
+from vsdenoise.mvtools import MVTools, MVToolsPresets, SADMode, SearchMode, MotionMode
 from vsdenoise.prefilters import Prefilter
+
+
+__all__ = [
+        'TemporalDegrain2'
+        ]
+
 
 def m4(num: int):
     16 if num < 16 else mod4(num)
@@ -43,7 +49,7 @@ class TemporalDegrain2:
     ppSAD1: int | None = None
     ppSAD2: int | None = None
     ppSCD1: int | None = None
-    thSCD2: int = 128
+    thSCD2: int = 50
     DCT: int = 0
     SubPelInterp: int = 2
     SrchClipPP: int | Prefilter | None =  None

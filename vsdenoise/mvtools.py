@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import chain
 from math import ceil, exp
-from typing import TYPE_CHECKING, Any, Literal, Self, Sequence, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Sequence, TypeVar, cast, overload
 
 from _collections_abc import dict_items, dict_keys, dict_values
 from vstools import (
