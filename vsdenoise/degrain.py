@@ -15,37 +15,39 @@ __all__ = [
         'TemporalDegrain2'
         ]
 
+## differences
+# degrainPlane => planes
+# rec => refine
+# Refine can now be an int to describe the number of times/steps to refine
 
-def m4(num: int):
-    16 if num < 16 else mod4(num)
+# thSCD2 range is 0-100, per the vs-denoise standard
 
-def fft3d(clip: vs.VideoNode, **kwargs):
-    if hasattr(core, 'neo_fft3d'):
-      return core.neo_fft3d.FFT3D(clip, **kwargs)
-    else:
-      return core.fft3dfilter.FFT3DFilter(clip, **kwargs)
-
+# Support for passing in custom prefilters functions, or prefiltered clips
+# Support for passing in custom post denoisers
 @dataclass
 class TemporalDegrain2:
+    # Main tunables
     degrainTR: int = 1
-    # TODO: change to planes? Or support list of planes?
-    degrainPlane: int = 4
     grainLevel: int = 2
+
+    # TODO: change to planes? Or support list of planes?
+    # Add support for array or int and call it 'planes'
+    planes: int | list[int]  = 4
+
+    # TODO: Support custom functions
+    postFFT: int | Callable[[vs.VideoNode], vs.VideoNode] = 0
+    postSigma: int = 1
+
+    # Tuning / output params
     grainLevelSetup: bool = False
+    outputStage: int = 2
+
+#  Motion params
     meAlg: int = 4
     meAlgPar: int | None = None
     meSubpel: int | None = None
     meBlksz: int | None = None
     meTM: bool = False
-    limitSigma: int | None = None
-    limitBlksz: int | None = None
-    fftThreads: int | None = None
-    postFFT: int = 0
-    postTR: int = 1
-    postSigma: int = 1
-    postMix: int = 0
-    postBlkSize: int | None = None
-    knlDevId: int | None = 0
     ppSAD1: int | None = None
     ppSAD2: int | None = None
     ppSCD1: int | None = None
@@ -55,10 +57,23 @@ class TemporalDegrain2:
     SrchClipPP: int | Prefilter | None =  None
     GlobalMotion: bool = True
     ChromaMotion: bool = True
-    rec: bool = False # TODO:  rename 'refine'?
-    extraSharp: bool = False
-    outputStage: int = 2
+    refine: bool | int = False 
+
+# denoisers
     limiter: Callable[[vs.VideoNode], vs.VideoNode] | None = None # Function used to limit the maximum denoising effect MVDegrain can have. Defaults to custom FFT3DFilter
+    limitSigma: int | None = None
+    limitBlksz: int | None = None
+    knlDevId: int | None = 0
+
+# post denoising
+    postTR: int = 1
+    postMix: int = 0
+    postBlkSize: int | None = None
+
+# various knobs
+# TODO support ints allow choosing a custom sharpening radius.
+    extraSharp: bool = False
+    fftThreads: int | None = None
 
     def denoise(self, clip: vs.VideoNode) -> vs.VideoNode:
         # TODO allow parameter overrides...
@@ -69,13 +84,12 @@ class TemporalDegrain2:
         isFLOAT = get_sample_type(clip) == vs.FLOAT
         isGRAY = get_color_family(clip) == vs.GRAY
 
-        degrainPlane = self.degrainPlane
-        ChromaNoise = degrainPlane > 0
+        planes = self.planes
         ChromaMotion = self.ChromaMotion
+
         if isGRAY:
             ChromaMotion = False
-            ChromaNoise = False
-            degrainPlane = 0
+            planes = 0
 
         longlat = max(width, height)
         shortlat = min(width, height)
@@ -97,34 +111,48 @@ class TemporalDegrain2:
         else:
             autoTune = 3
 
-        fPlane = [[0], [1], [2], [1,2], [0,1,2]][degrainPlane]
+        if isinstance(planes, int):
+            # Convert int-based plane selection to array-based plane selection to match the normal VS standard
+            planes = [[0], [1], [2], [1,2], [0,1,2]][planes]
 
-        postFFT = self.postFFT
         postTR = self.postTR
+        postTD  = postTR * 2 + 1
         postSigma = self.postSigma
-        postBlkSize = fallback(self.postBlkSize, [0,48,32,12,0,0][self.postFFT])
         postMix = self.postMix
-        if postFFT <= 0:
-            postTR = 0
-        if postFFT == 3:
-            postTR = min(postTR, 7)
-        if postFFT in [1, 2]:
-            postTR = min(postTR, 2)
-
         knlDevId = self.knlDevId
         fftThreads = self.fftThreads
 
-        refine = 1 if self.rec else 0
-        meSubpel = fallback(self.meSubpel, [4, 2, 2, 1][autoTune])
-        meBlksz = fallback(self.meBlksz, [8, 8, 16, 32][autoTune])
-        meSharp = self.SubPelInterp
-        meAlg = self.meAlg
+        postFFT = self.postFFT
+        if isinstance(postFFT, int):
+            postBlkSize = fallback(self.postBlkSize, [0,48,32,12,0,0][postFFT])
+            if postFFT <= 0:
+                postTR = 0
+            if postFFT == 3:
+                postTR = min(postTR, 7)
+            if postFFT in [1, 2]:
+                postTR = min(postTR, 2)
+
+            postDenoiser = [
+                    partial(removegrain, mode=1),
+                    partial(fft3d, sigma=postSigma, planes=planes, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
+                    partial(fft3d, sigma=postSigma, planes=planes, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
+                    partial(DFTTest.denoise, sigma=postSigma * 4, tbsize=postTD, planes=planes, sbsize=postBlkSize, sosize=postBlkSize * 9/12),
+                    partial(nl_means, strength=postSigma / 2, tr=postTR, sr=2, device_id=knlDevId, planes=planes),
+                    ][postFFT]
+        else:
+            postDenoiser = postFFT
+
+
+        SrchClipPP = fallback(self.SrchClipPP, [0,0,0,3,3,3][self.grainLevel])
+
+        maxTR = max(degrainTR, postTR)
+
+        if isinstance(self.refine, bool):
+            refine = 1 if self.refine else 0
+        else:
+            refine = self.refine
+
         meTM = self.meTM
-        Overlap = meBlksz // 2
-        Lambda = (1000 if self.meTM else 100) * (meBlksz ** 2) // 64
-        PNew = 50 if self.meTM else 25
-        GlobalMotion = self.GlobalMotion
-        DCT = self.DCT
 
         # radius/range parameter for the motion estimation algorithms
         # AVS version uses the following, but values seemed to be based on an
@@ -132,23 +160,23 @@ class TemporalDegrain2:
         # it for the exact x264 behavior.
         # meAlgPar = [2,2,2,2,16,24,2,2][meAlg] 
         # Using Dogway's SMDegrain options here instead of the TemporalDegrain2 AVSI versions, which seem wrong.
-        meAlgPar = fallback(self.meAlgPar, 5 if self.rec and self.meTM else 2)
+        meAlgPar = fallback(self.meAlgPar, 5 if refine and meTM else 2)
+        meAlg = self.meAlg
 
-        limitAT = [-1, -1, 0, 0, 0, 1][grainLevel] + autoTune + 1
-        limitSigma = fallback(self.limitSigma, [6,8,12,16,32,48][limitAT])
-        limitBlksz = fallback(self.limitBlksz, [12,16,24,32,64,96][limitAT])
-
-        SrchClipPP = fallback(self.SrchClipPP, [0,0,0,3,3,3][self.grainLevel])
-        CMplanes = [0,1,2] if self.ChromaMotion else [0]
-        rad = 3 if self.extraSharp else None
+        meSubpel = fallback(self.meSubpel, [4, 2, 2, 1][autoTune])
+        meBlksz = fallback(self.meBlksz, [8, 8, 16, 32][autoTune])
         hpad = meBlksz
         vpad = meBlksz
-        postTD  = postTR * 2 + 1
-        maxTR = max(degrainTR, postTR)
-
+        meSharp = self.SubPelInterp
+        Overlap = meBlksz // 2
+        Lambda = (1000 if meTM else 100) * (meBlksz ** 2) // 64
+        PNew = 50 if meTM else 25
+        GlobalMotion = self.GlobalMotion
+        DCT = self.DCT
         ppSAD1 = fallback(self.ppSAD1,[3,5,7,9,11,13][grainLevel])
         ppSAD2 = fallback(self.ppSAD2,[2,4,5,6,7,8][grainLevel])
         ppSCD1 = fallback(self.ppSCD1,[3,3,3,4,5,6][grainLevel])
+        CMplanes = [0,1,2] if ChromaMotion else [0]
 
         if DCT == 5:
             #rescale threshold to match the SAD values when using SATD
@@ -161,6 +189,12 @@ class TemporalDegrain2:
         thSAD2 = int(ppSAD2 * 64)
         thSCD1 = int(ppSCD1 * 64)
         thSCD2 = self.thSCD2
+
+        limitAT = [-1, -1, 0, 0, 0, 1][grainLevel] + autoTune + 1
+        limitSigma = fallback(self.limitSigma, [6,8,12,16,32,48][limitAT])
+        limitBlksz = fallback(self.limitBlksz, [12,16,24,32,64,96][limitAT])
+
+        sharpenRadius = 3 if self.extraSharp else None
 
         def limiterFFT3D(clip: vs.VideoNode) -> vs.VideoNode:
             s2 = limitSigma * 0.625
@@ -192,7 +226,7 @@ class TemporalDegrain2:
                       super_args=dict(chroma=ChromaMotion),
                       analyze_args=dict(chroma=ChromaMotion),
                       recalculate_args=dict(thsad=thSAD1 // 2, lambda_=Lambda//4),
-                      planes=fPlane)
+                      planes=planes)
 
         # Run motion analysis on the widest tr that we'll use for any operation,
         # whether degrain or post, and then reuse them for all following operations.
@@ -201,8 +235,7 @@ class TemporalDegrain2:
 
         # First MV-denoising stage. Usually here's some temporal-medianfiltering going on.
         # For simplicity, we just use MDegrain.
-        mv1 = MVTools(clip, vectors=maxMV, **preset)
-        NR1 = mv1.degrain(thSAD=thSAD1, thSCD=(thSCD1, thSCD2))
+        NR1 = MVTools(clip, vectors=maxMV, **preset).degrain(thSAD=thSAD1, thSCD=(thSCD1, thSCD2))
 
         if degrainTR > 0:
             spatD = limiter(clip)
@@ -214,26 +247,18 @@ class TemporalDegrain2:
             NR1x = core.std.MakeDiff(clip, DD, [0])
 
             # Second MV-denoising stage. We use MDegrain.
-            mv2 = MVTools(NR1x, vectors=maxMV, **preset)
-            NR2 = mv2.degrain(thSAD=thSAD2, thSCD=(thSCD1, thSCD2))
+            NR2 = MVTools(NR1x, vectors=maxMV, **preset).degrain(thSAD=thSAD2, thSCD=(thSCD1, thSCD2))
         else:
             NR2 = clip
 
-        postDenoiser = [
-                partial(removegrain, mode=1),
-                partial(fft3d, sigma=postSigma, planes=fPlane, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
-                partial(fft3d, sigma=postSigma, planes=fPlane, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
-                partial(DFTTest.denoise, sigma=postSigma * 4, tbsize=postTD, planes=fPlane, sbsize=postBlkSize, sosize=postBlkSize * 9/12),
-                partial(nl_means, strength=postSigma / 2, tr=postTR, sr=2, device_id=knlDevId, planes=fPlane),
-                ][postFFT]
-
+        # Post (final stage) denoising.
         if postTR > 0:
-            mvNoiseWindow = MVTools(NR2, vectors=mv1, **preset(tr=postTR))
-            dnWindow = mvNoiseWindow.compensate(postDenoiser, thSAD=thSAD2, )
+            mvNoiseWindow = MVTools(NR2, vectors=maxMV, **preset(tr=postTR))
+            dnWindow = mvNoiseWindow.compensate(postDenoiser, thSAD=thSAD2, thSCD=(thSCD1, thSCD2) )
         else:
             dnWindow = postDenoiser(NR2)
 
-        sharpened = contrasharpening(dnWindow, clip, rad)
+        sharpened = contrasharpening(dnWindow, clip, sharpenRadius)
 
         if postMix > 0:
             sharpened = core.std.Expr([clip,sharpened],f"x {postMix} * y {100-postMix} * + 100 /")
@@ -241,3 +266,11 @@ class TemporalDegrain2:
         return [NR1x, NR2, sharpened][outputStage]
 
 
+def m4(num: int):
+    16 if num < 16 else mod4(num)
+
+def fft3d(clip: vs.VideoNode, **kwargs):
+    if hasattr(core, 'neo_fft3d'):
+      return core.neo_fft3d.FFT3D(clip, **kwargs)
+    else:
+      return core.fft3dfilter.FFT3DFilter(clip, **kwargs)
