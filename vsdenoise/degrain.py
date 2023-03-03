@@ -20,6 +20,8 @@ class TemporalDegrain2:
     TemporalDegrain2
 
     Changes from older implementations:
+        1. `degrainTr` was renamed to just `tr` to better align with vsdenoise standards.
+            * `postTr` still remains to differentiate between the two.
         1. `degrainPlane` was renamed to `planes` to better align with vsdenoise standards. 
             * It was also updated to be an int or a list.
         2. `rec` was renamed to `refine` to better align with vsdenoise standards.
@@ -51,7 +53,7 @@ class TemporalDegrain2:
 
     """
     # Main tunables
-    degrainTR: int = 1
+    tr: int = 1
     grainLevel: int = 2
 
     planes: int | list[int]  = 4
@@ -94,7 +96,7 @@ class TemporalDegrain2:
     postBlkSize: int | None = None
 
     def denoise(self, clip: vs.VideoNode, /,
-                degrainTR: int | None = None, grainLevel: int | None = None, postFFT: int | Callable[[vs.VideoNode], vs.VideoNode] | None = None, postSigma: int | None = None, planes: int | list[int] | None = None,
+                tr: int | None = None, grainLevel: int | None = None, postFFT: int | Callable[[vs.VideoNode], vs.VideoNode] | None = None, postSigma: int | None = None, planes: int | list[int] | None = None,
                 *, grainLevelSetup: bool | None = None, outputStage: int | None = None, meAlg: int | None = None, meAlgPar: int | None = None, meSubpel: int | None = None, meBlksz: int | None = None, meTM: bool | None = None, ppSAD1: int | None = None,
                 ppSAD2: int | None = None, ppSCD1: int | None = None, thSCD2: int | None = None, DCT: int | None = None, SubPelInterp: int | None = None, SrchClipPP: int | Prefilter | vs.VideoNode | None = None, GlobalMotion: bool | None = None,
                 ChromaMotion: bool | None = None, refine: bool | int | None = None, limiter: Prefilter | Callable[[vs.VideoNode], vs.VideoNode] | vs.VideoNode | None = None, limitSigma: int | None = None,
@@ -169,12 +171,12 @@ class TemporalDegrain2:
         # Scale grainLevel from -2-3 -> 0-5
         grainLevel = fallback(grainLevel, self.grainLevel) + 2
 
-        degrainTR = fallback(degrainTR, self.degrainTR)
+        tr = fallback(tr, self.tr)
         outputStage = fallback(outputStage, self.outputStage)
         grainLevelSetup = fallback(grainLevelSetup, self.grainLevelSetup)
         if grainLevelSetup:
             outputStage = 0
-            degrainTR = 3
+            tr = 3
 
         if (longlat<=1050 and shortlat<=576):
             autoTune = 0
@@ -205,7 +207,7 @@ class TemporalDegrain2:
                     partial(removegrain, mode=1),
                     partial(_fft3d, sigma=postSigma, planes=planes, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
                     partial(_fft3d, sigma=postSigma, planes=planes, bt=postTD, ncpu=fftThreads, bw=postBlkSize, bh=postBlkSize),
-                    partial(DFTTest.denoise, sigma=postSigma * 4, tbsize=postTD, planes=planes, sbsize=postBlkSize, sosize=postBlkSize * 9/12),
+                    partial(DFTTest.denoise, sloc=postSigma * 4, tr=postTR, planes=planes, block_size=postBlkSize, overlap=postBlkSize * 9/12),
                     partial(nl_means, strength=postSigma / 2, tr=postTR, sr=2, device_id=gpuId, planes=planes),
                     ][postFFT]
         else:
@@ -213,7 +215,7 @@ class TemporalDegrain2:
 
         SrchClipPP = fallback(SrchClipPP, self.SrchClipPP, [0,0,0,3,3,3][grainLevel])
 
-        maxTR = max(degrainTR, postTR)
+        maxTR = max(tr, postTR)
 
         refine = fallback(refine, self.refine)
         refine = 1 if isinstance(refine, bool) and self.refine else 0
@@ -237,7 +239,7 @@ class TemporalDegrain2:
         Lambda = (1000 if meTM else 100) * (meBlksz ** 2) // 64
         PNew = 50 if meTM else 25
         GlobalMotion = fallback(GlobalMotion, self.GlobalMotion)
-        DCT = self.DCT
+        DCT = fallback(DCT, self.DCT)
         ppSAD1 = fallback(ppSAD1, self.ppSAD1,[3,5,7,9,11,13][grainLevel])
         ppSAD2 = fallback(ppSAD2, self.ppSAD2,[2,4,5,6,7,8][grainLevel])
         ppSCD1 = fallback(ppSCD1, self.ppSCD1,[3,3,3,4,5,6][grainLevel])
@@ -253,7 +255,7 @@ class TemporalDegrain2:
         thSAD1 = int(ppSAD1 * 64)
         thSAD2 = int(ppSAD2 * 64)
         thSCD1 = int(ppSCD1 * 64)
-        thSCD2 = self.thSCD2
+        thSCD2 = fallback(thSCD2, self.thSCD2)
 
         limitAT = [-1, -1, 0, 0, 0, 1][grainLevel] + autoTune + 1
         limitSigma = fallback(limitSigma, self.limitSigma, [6,8,12,16,32,48][limitAT])
@@ -262,6 +264,7 @@ class TemporalDegrain2:
         sharpenRadius = fallback(extraSharp, self.extraSharp)
         sharpenRadius = 3 if isinstance(sharpenRadius, bool) and sharpenRadius else None
 
+        # TODO: Provide DFTTest version for improved quality + performance.
         def limiterFFT3D(clip: vs.VideoNode) -> vs.VideoNode:
             s2 = limitSigma * 0.625
             s3 = limitSigma * 0.375
@@ -283,7 +286,7 @@ class TemporalDegrain2:
             srchClip = [Prefilter.NONE, Prefilter.SCALEDBLUR, Prefilter.GAUSSBLUR1, Prefilter.GAUSSBLUR2][SrchClipPP](clip)
 
         # TODO Add thSADC support, like AVS version
-        preset = MVToolsPresets.CUSTOM(tr=degrainTR, refine=refine, prefilter=srchClip,
+        preset = MVToolsPresets.CUSTOM(tr=tr, refine=refine, prefilter=srchClip,
                       pel=meSubpel, hpad=hpad, vpad=vpad, sharp=meSharp,
                       block_size=meBlksz, overlap=Overlap, 
                       search=SearchMode(meAlg)(recalc_mode=SearchMode(meAlg), param=meAlgPar, pel=meSubpel),
@@ -303,7 +306,7 @@ class TemporalDegrain2:
         # For simplicity, we just use MDegrain.
         NR1 = MVTools(clip, vectors=maxMV, **preset).degrain(thSAD=thSAD1, thSCD=(thSCD1, thSCD2))
 
-        if degrainTR > 0:
+        if tr > 0:
             if isinstance(limiter, vs.VideoNode): 
                 spat = limiter
             else:
